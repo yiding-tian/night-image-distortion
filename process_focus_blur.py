@@ -36,6 +36,44 @@ FOCUS_LEVELS = {
 }
 
 # ========================================================
+# System Prompt & SFT Templates (CoT Technical Version)
+# ========================================================
+SYSTEM_PROMPT_TEXT = (
+    "You are a professional AI visual expert. Provide a structured Chain-of-Thought (CoT) diagnosis for nighttime images. "
+    "Your analysis must follow this exact sequence: \n"
+    "1. Scene Description: Describe the objects and environment.\n"
+    "2. Quality Issue Detection: Determine if a distortion exists.\n"
+    "3. Distribution Scope: Classify as Global or Local.\n"
+    "4. Distortion Specifics: Identify the type and the specific affected target.\n"
+    "5. Severity Level: Assess the intensity of the degradation."
+)
+
+QUESTION_TEMPLATES = [
+    "Analyze this nighttime image using a step-by-step technical diagnosis. First, describe the scene contents. Then, detect any image quality issues, determine their scope (Global/Local), specify the distortion type and affected target, and finally assess the severity.",
+    "Please perform a Chain-of-Thought assessment of this photo. 1. What are the main objects? 2. Is there a technical defect? 3. Is the defect global or local? 4. What is the specific distortion and where is it located? 5. What is the severity level?",
+    "Examine the image quality. Start by describing the scene, then provide a structured report covering: Issue Detection, Spatial Scope, Type & Target identification, and Severity Level.",
+    "Conduct a technical analysis: Scene Description -> Issue Detection -> Distribution Scope -> Distortion & Target Specifics -> Severity Level. Ensure each step is addressed in order.",
+    "As a visual expert, identify the elements in this scene and diagnose its quality. Is there a problem? Is it Global or Local? Name the specific distortion/target and evaluate the severity level."
+]
+
+def get_clean_desc(visual_analysis):
+    import re
+    match = re.search(r'(?i)Defect', visual_analysis)
+    if match:
+        return visual_analysis[:match.start()].strip().rstrip('.,; ')
+    return visual_analysis.strip()
+
+# CoT 结构化回答模板
+ANSWER_TEMPLATE = (
+    "Technical Analysis (CoT):\n"
+    "1. Scene Description: {scene_desc}.\n"
+    "2. Quality Issue Detection: Yes, a technical degradation is identified.\n"
+    "3. Distribution Scope: {scope}.\n"
+    "4. Distortion Specifics: The {type} is specifically localized at the {target}.\n"
+    "5. Severity Level: {level}."
+)
+
+# ========================================================
 # Visualization Helper: Small Dot Focus Indicator
 # ========================================================
 def draw_red_cross(img, cx, cy, img_h, img_w):
@@ -176,7 +214,7 @@ def find_focal_point_from_mask(subdir, secondary_object):
 # Workflow Logic
 # ========================================================
 
-def process_single_directory(subdir, output_folder, level_name, secondary_object, dataset_results, dataset_lock, cmp_mode=False):
+def process_single_directory(subdir, output_folder, level_name, main_subject, secondary_object, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
     folder_name = os.path.basename(subdir)
     image_path = os.path.join(subdir, "raw_image.jpg")
     depth_path = os.path.join(subdir, "raw_image_depth.png")
@@ -192,11 +230,11 @@ def process_single_directory(subdir, output_folder, level_name, secondary_object
     h, w = image.shape[:2]
 
     try:
+        # 焦点对准 secondary_object
         focal_point = find_focal_point_from_mask(subdir, secondary_object)
         
         is_random_focus = False
         if focal_point is None:
-            # 记录并打印寻找失败的物体
             print(f"\n[!] 匹配失败: '{folder_name}' 找不到 '{secondary_object}' 的Mask。使用随机对焦。")
             is_random_focus = True
             focal_point = (random.randint(int(w*0.3), int(w*0.7)), random.randint(int(h*0.3), int(h*0.7)))
@@ -230,16 +268,40 @@ def process_single_directory(subdir, output_folder, level_name, secondary_object
         out_path = os.path.join(output_folder, output_filename)
         cv2.imwrite(out_path, final_vis_image)
 
+        # [MODIFIED] 生成符合 CoT 逻辑的对话内容 (system + user + assistant)
+        scene_desc = get_clean_desc(visual_analysis)
+        instruction_text = random.choice(QUESTION_TEMPLATES)
+        
+        answer_text = ANSWER_TEMPLATE.format(
+            scene_desc=scene_desc,
+            scope="Local",
+            type="Defocus Blur",
+            target=main_subject,
+            level=level_name.capitalize()
+        )
+
+        entry = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT_TEXT
+                },
+                {
+                    "role": "user",
+                    "content": f"{instruction_text}\n<image>"
+                },
+                {
+                    "role": "assistant",
+                    "content": answer_text
+                }
+            ],
+            "images": [
+                out_path 
+            ]
+        }
+
         with dataset_lock:
-            dataset_results.append({
-                "folder": folder_name,
-                "level": level_name,
-                "max_blur_radius": max_radius,
-                "focus_point": [focal_point[0], focal_point[1]],
-                "focus_object": secondary_object,
-                "is_random_focus": is_random_focus,
-                "output_file": output_filename
-            })
+            dataset_results.append(entry)
         
     except Exception as e:
         print(f"Error processing {folder_name}: {e}")
@@ -251,6 +313,7 @@ def main():
     parser.add_argument("--output_folder", type=str, default="depth_focus_blur_outputs")
     parser.add_argument("--num_threads", type=int, default=4)
     parser.add_argument("--max_images", type=int, default=None)
+    parser.add_argument("--dataset_json", type=str, default="focus_blur_sft.json", help="SFT 数据集 JSON 文件名")
     parser.add_argument('--level', type=str, choices=['slight', 'medium', 'severe', 'random'], default='medium')
     parser.add_argument('--cmp', action='store_true')
 
@@ -261,7 +324,12 @@ def main():
         return
 
     with open(args.main_json, 'r', encoding='utf-8') as f:
-        config_data = json.load(f)
+        main_data_raw = json.load(f)
+
+    if isinstance(main_data_raw, list):
+        config_data = {item['filename']: item for item in main_data_raw}
+    else:
+        config_data = main_data_raw
 
     tasks = []
     for filename, info in config_data.items():
@@ -271,9 +339,11 @@ def main():
         focus_cfg = aug.get("can_add_focus_blur", {})
         
         if focus_cfg.get("feasible") is True and os.path.isdir(subdir):
+            main_subject = focus_cfg.get("main_subject")
             secondary_obj = focus_cfg.get("secondary_object")
-            if secondary_obj:
-                tasks.append((subdir, secondary_obj))
+            visual_analysis = info.get("visual_analysis", "")
+            if secondary_obj and main_subject:
+                tasks.append((subdir, main_subject, secondary_obj, visual_analysis))
 
     if args.max_images:
         tasks = tasks[:args.max_images]
@@ -290,16 +360,20 @@ def main():
             process_single_directory, s, 
             os.path.join(args.output_folder, args.level if args.level != 'random' else random.choice(available_levels)), 
             args.level if args.level != 'random' else random.choice(available_levels), 
-            o, dataset_results, dataset_lock, args.cmp
-        ): s for s, o in tasks}
+            m, o, dataset_results, dataset_lock, v, args.cmp
+        ): s for s, m, o, v in tasks}
         
         for _ in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Processing"):
             pass
 
-    with open(os.path.join(args.output_folder, "depth_defocus_dataset.json"), "w", encoding='utf-8') as f:
-        json.dump(dataset_results, f, indent=4, ensure_ascii=False)
+    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
+    if dataset_results:
+        with open(args.dataset_json, 'w', encoding='utf-8') as f:
+            json.dump(dataset_results, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✨ Finished. Total Time: {time.time() - start_time:.2f}s")
+    print(f"\n--- Processing Finished ---")
+    print(f"Total time: {time.time() - start_time:.2f}s")
+    print(f"Dataset saved to: {args.dataset_json}")
 
 if __name__ == "__main__":
     main()

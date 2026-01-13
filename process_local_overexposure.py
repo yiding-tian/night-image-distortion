@@ -40,21 +40,42 @@ OVEREXPOSURE_LEVELS = {
 }
 
 # ========================================================
-# System Prompt (English Version) - 统一系统提示
+# System Prompt & SFT Templates (CoT Technical Version)
 # ========================================================
 SYSTEM_PROMPT_TEXT = (
-    "You are an AI visual expert specializing in nighttime image quality assessment and restoration. "
-    "I will provide a nighttime image. Please professionally diagnose and analyze its image quality based on the following six core dimensions:\n\n"
-    "1. **Noise**: Evaluate luminance and color noise caused by high ISO, and check for artifacts.\n"
-    "2. **Underexposure**: Check if the image is too dark, with crushed shadows losing details.\n"
-    "3. **Overexposure**: Check for clipped highlights (e.g., streetlights) and blooming effects.\n"
-    "4. **Motion Blur**: Identify local trailing effects caused by fast-moving subjects.\n"
-    "5. **Defocus Blur**: Determine if there is an out-of-focus issue affecting the whole subject.\n"
-    "6. **Camera Shake**: Identify global, directional blur caused by unstable handheld shooting.\n\n"
-    "Please output an objective, structured analysis report based on the user's specific instruction."
+    "You are a professional AI visual expert. Provide a structured Chain-of-Thought (CoT) diagnosis for nighttime images. "
+    "Your analysis must follow this exact sequence: \n"
+    "1. Scene Description: Describe the objects and environment.\n"
+    "2. Quality Issue Detection: Determine if a distortion exists.\n"
+    "3. Distribution Scope: Classify as Global or Local.\n"
+    "4. Distortion Specifics: Identify the type and the specific affected target.\n"
+    "5. Severity Level: Assess the intensity of the degradation."
 )
 
-# ... (QUESTION/ANSWER TEMPLATES)
+QUESTION_TEMPLATES = [
+    "Analyze this nighttime image using a step-by-step technical diagnosis. First, describe the scene contents. Then, detect any image quality issues, determine their scope (Global/Local), specify the distortion type and affected target, and finally assess the severity.",
+    "Please perform a Chain-of-Thought assessment of this photo. 1. What are the main objects? 2. Is there a technical defect? 3. Is the defect global or local? 4. What is the specific distortion and where is it located? 5. What is the severity level?",
+    "Examine the image quality. Start by describing the scene, then provide a structured report covering: Issue Detection, Spatial Scope, Type & Target identification, and Severity Level.",
+    "Conduct a technical analysis: Scene Description -> Issue Detection -> Distribution Scope -> Distortion & Target Specifics -> Severity Level. Ensure each step is addressed in order.",
+    "As a visual expert, identify the elements in this scene and diagnose its quality. Is there a problem? Is it Global or Local? Name the specific distortion/target and evaluate the severity level."
+]
+
+def get_clean_desc(visual_analysis):
+    import re
+    match = re.search(r'(?i)Defect', visual_analysis)
+    if match:
+        return visual_analysis[:match.start()].strip().rstrip('.,; ')
+    return visual_analysis.strip()
+
+# CoT 结构化回答模板
+ANSWER_TEMPLATE = (
+    "Technical Analysis (CoT):\n"
+    "1. Scene Description: {scene_desc}.\n"
+    "2. Quality Issue Detection: Yes, a technical degradation is identified.\n"
+    "3. Distribution Scope: {scope}.\n"
+    "4. Distortion Specifics: The {type} is specifically localized at the {target}.\n"
+    "5. Severity Level: {level}."
+)
 
 # ========================================================
 # Core Logic
@@ -94,7 +115,7 @@ def apply_atmospheric_bloom(img, mask, sigma, intensity):
     
     return (final_img * 255).astype(np.uint8)
 
-def process_image_overexposure(folder_path, target_label, output_folder, level_name, dataset_results, dataset_lock, sigma, intensity, cmp_mode=False):
+def process_image_overexposure(folder_path, target_label, output_folder, level_name, dataset_results, dataset_lock, sigma, intensity, visual_analysis, cmp_mode=False):
     folder_name = os.path.basename(folder_path)
     raw_img_path = os.path.join(folder_path, "raw_image.jpg")
     mask_dir = os.path.join(folder_path, "mask")
@@ -143,6 +164,41 @@ def process_image_overexposure(folder_path, target_label, output_folder, level_n
     out_path = os.path.join(output_folder, output_filename)
     cv2.imwrite(out_path, final_image)
 
+    # [MODIFIED] 生成符合 CoT 逻辑的对话内容 (system + user + assistant)
+    scene_desc = get_clean_desc(visual_analysis)
+    instruction_text = random.choice(QUESTION_TEMPLATES)
+    
+    answer_text = ANSWER_TEMPLATE.format(
+        scene_desc=scene_desc,
+        scope="Local",
+        type="Local Overexposure",
+        target=target_label,
+        level=level_name.capitalize()
+    )
+
+    entry = {
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT_TEXT
+            },
+            {
+                "role": "user",
+                "content": f"{instruction_text}\n<image>"
+            },
+            {
+                "role": "assistant",
+                "content": answer_text
+            }
+        ],
+        "images": [
+            out_path 
+        ]
+    }
+
+    with dataset_lock:
+        dataset_results.append(entry)
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Nighttime Local Overexposure dataset.")
     parser.add_argument('--base_folder', type=str, required=True, help='Source folder containing subfolders with raw_image.jpg')
@@ -162,7 +218,12 @@ def main():
         return
 
     with open(args.main_json, 'r', encoding='utf-8') as f:
-        main_data = json.load(f)
+        main_data_raw = json.load(f)
+
+    if isinstance(main_data_raw, list):
+        main_data = {item['filename']: item for item in main_data_raw}
+    else:
+        main_data = main_data_raw
 
     tasks = []
     for filename, info in main_data.items():
@@ -172,8 +233,9 @@ def main():
         motion = info.get("augmentation_assessment", {}).get("can_add_local_overexposure", {})
         if motion.get("feasible") is True:
             target = motion.get("target_source")
+            visual_analysis = info.get("visual_analysis", "")
             if target and os.path.isdir(folder_path):
-                tasks.append((folder_path, target))
+                tasks.append((folder_path, target, visual_analysis))
 
     if args.max_images: tasks = tasks[:args.max_images]
 
@@ -186,21 +248,28 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_threads) as executor:
         futures = {}
-        for p, t in tasks:
+        for p, t, v in tasks:
             current_level = args.level if args.level != 'random' else random.choice(available_levels)
             level_params = OVEREXPOSURE_LEVELS[current_level]
             sigma = random.uniform(*level_params["sigma"])
             intensity = random.uniform(*level_params["intensity"])
             level_output_folder = f"{args.output_folder}/{current_level}"
             
-            future = executor.submit(process_image_overexposure, p, t, level_output_folder, current_level, dataset_results, dataset_lock, sigma, intensity, args.cmp)
+            future = executor.submit(process_image_overexposure, p, t, level_output_folder, current_level, dataset_results, dataset_lock, sigma, intensity, v, args.cmp)
             futures[future] = (p, t)
 
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Processing images"):
             pass
 
+    # [MODIFIED] Save dataset to JSON file (re-enabled)
+    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
+    if dataset_results:
+        with open(args.dataset_json, 'w', encoding='utf-8') as f:
+            json.dump(dataset_results, f, indent=2, ensure_ascii=False)
+
     print(f"\n--- Processing Finished ---")
     print(f"Total time: {time.time() - start_time:.2f}s")
+    print(f"Dataset saved to: {args.dataset_json}")
 
 if __name__ == "__main__":
     main()

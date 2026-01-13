@@ -54,6 +54,44 @@ UNDEREXPOSURE_LEVELS = {
 }
 
 # ========================================================
+# System Prompt & SFT Templates (CoT Technical Version)
+# ========================================================
+SYSTEM_PROMPT_TEXT = (
+    "You are a professional AI visual expert. Provide a structured Chain-of-Thought (CoT) diagnosis for nighttime images. "
+    "Your analysis must follow this exact sequence: \n"
+    "1. Scene Description: Describe the objects and environment.\n"
+    "2. Quality Issue Detection: Determine if a distortion exists.\n"
+    "3. Distribution Scope: Classify as Global or Local.\n"
+    "4. Distortion Specifics: Identify the type and the specific affected target.\n"
+    "5. Severity Level: Assess the intensity of the degradation."
+)
+
+QUESTION_TEMPLATES = [
+    "Analyze this nighttime image using a step-by-step technical diagnosis. First, describe the scene contents. Then, detect any image quality issues, determine their scope (Global/Local), specify the distortion type and affected target, and finally assess the severity.",
+    "Please perform a Chain-of-Thought assessment of this photo. 1. What are the main objects? 2. Is there a technical defect? 3. Is the defect global or local? 4. What is the specific distortion and where is it located? 5. What is the severity level?",
+    "Examine the image quality. Start by describing the scene, then provide a structured report covering: Issue Detection, Spatial Scope, Type & Target identification, and Severity Level.",
+    "Conduct a technical analysis: Scene Description -> Issue Detection -> Distribution Scope -> Distortion & Target Specifics -> Severity Level. Ensure each step is addressed in order.",
+    "As a visual expert, identify the elements in this scene and diagnose its quality. Is there a problem? Is it Global or Local? Name the specific distortion/target and evaluate the severity level."
+]
+
+def get_clean_desc(visual_analysis):
+    import re
+    match = re.search(r'(?i)Defect', visual_analysis)
+    if match:
+        return visual_analysis[:match.start()].strip().rstrip('.,; ')
+    return visual_analysis.strip()
+
+# CoT 结构化回答模板
+ANSWER_TEMPLATE = (
+    "Technical Analysis (CoT):\n"
+    "1. Scene Description: {scene_desc}.\n"
+    "2. Quality Issue Detection: Yes, a technical degradation is identified.\n"
+    "3. Distribution Scope: {scope}.\n"
+    "4. Distortion Specifics: The {type} {target_info}.\n"
+    "5. Severity Level: {level}."
+)
+
+# ========================================================
 # Core Logic: Linear Dimming + ISO Noise
 # ========================================================
 
@@ -93,7 +131,7 @@ def apply_moderate_underexposure(img, brightness_factor, noise_prob, iso_color, 
     
     return final_img
 
-def process_single_folder(folder_path, output_folder, level_name, params, cmp_mode=False):
+def process_single_folder(folder_path, output_folder, level_name, params, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
     folder_name = os.path.basename(folder_path)
     raw_img_path = os.path.join(folder_path, "raw_image.jpg")
     
@@ -102,6 +140,10 @@ def process_single_folder(folder_path, output_folder, level_name, params, cmp_mo
 
     img = cv2.imread(raw_img_path)
     if img is None: return
+
+    output_filename = f"{folder_name}.jpg"
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, output_filename)
 
     # 随机取样参数
     b_factor = random.uniform(*params["brightness_factor"])
@@ -132,13 +174,50 @@ def process_single_folder(folder_path, output_folder, level_name, params, cmp_mo
         final_image = np.vstack([header, np.hstack([img, processed_img])])
 
     # 保存
-    os.makedirs(output_folder, exist_ok=True)
-    cv2.imwrite(os.path.join(output_folder, f"{folder_name}.jpg"), final_image)
+    cv2.imwrite(output_path, final_image)
+
+    # [MODIFIED] 生成符合 CoT 逻辑的对话内容
+    scene_desc = get_clean_desc(visual_analysis)
+    instruction_text = random.choice(QUESTION_TEMPLATES)
+    
+    answer_text = ANSWER_TEMPLATE.format(
+        scene_desc=scene_desc,
+        scope="Global",
+        type="Underexposure",
+        target_info="is uniformly distributed across the entire dark scene",
+        level=level_name.capitalize()
+    )
+
+    entry = {
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT_TEXT
+            },
+            {
+                "role": "user",
+                "content": f"{instruction_text}\n<image>"
+            },
+            {
+                "role": "assistant",
+                "content": answer_text
+            }
+        ],
+        "images": [
+            output_path 
+        ]
+    }
+
+    with dataset_lock:
+        dataset_results.append(entry)
 
 def main():
+    start_time = time.time()
     parser = argparse.ArgumentParser(description="Generate Moderate Underexposure with Noise")
     parser.add_argument('--base_folder', type=str, required=True, help='数据集根目录')
-    parser.add_argument('--output_folder', type=str, default='moderate_underexposure_outputs')
+    parser.add_argument('--main_json', type=str, required=True, help='Path to dataset_with_prompt.json')
+    parser.add_argument('--output_folder', type=str, default='underexposure_results')
+    parser.add_argument('--dataset_json', type=str, default='underexposure_sft.json', help='结果清单文件名。')
     parser.add_argument('--level', type=str, choices=['slight', 'medium', 'severe', 'random'], default='medium')
     parser.add_argument('--num_threads', type=int, default=4)
     parser.add_argument('--max_images', type=int, default=None)
@@ -150,29 +229,59 @@ def main():
         print(f"Error: Base directory not found at '{args.base_folder}'")
         return
 
-    subfolders = [f.path for f in os.scandir(args.base_folder) if f.is_dir()]
+    if not os.path.exists(args.main_json):
+        print(f"Error: JSON file '{args.main_json}' not found.")
+        return
+
+    with open(args.main_json, 'r', encoding='utf-8') as f:
+        main_data_raw = json.load(f)
+
+    if isinstance(main_data_raw, list):
+        main_data = {item['filename']: item for item in main_data_raw}
+    else:
+        main_data = main_data_raw
+
+    subfolders_info = []
+    for filename, info in main_data.items():
+        folder_name = os.path.splitext(filename)[0]
+        folder_path = os.path.join(args.base_folder, folder_name)
+        if os.path.isdir(folder_path):
+            subfolders_info.append((folder_path, info.get("visual_analysis", "")))
+
     if args.max_images:
-        subfolders = subfolders[:args.max_images]
+        subfolders_info = subfolders_info[:args.max_images]
     
-    print(f"🚀 任务启动 | 模式: 中度低曝 + 噪点 | 文件夹数量: {len(subfolders)}")
+    print(f"🚀 任务启动 | 模式: 中度低曝 + 噪点 | 文件夹数量: {len(subfolders_info)}")
 
     available_levels = ['slight', 'medium', 'severe']
+    dataset_results = []
+    dataset_lock = threading.Lock()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_threads) as executor:
         futures = {}
-        for folder in subfolders:
+        for folder, visual_analysis in subfolders_info:
             current_level = args.level if args.level != 'random' else random.choice(available_levels)
             params = UNDEREXPOSURE_LEVELS[current_level]
             
             level_out_dir = os.path.join(args.output_folder, current_level)
             
-            future = executor.submit(process_single_folder, folder, level_out_dir, current_level, params, args.cmp)
+            future = executor.submit(process_single_folder, folder, level_out_dir, current_level, params, dataset_results, dataset_lock, visual_analysis, args.cmp)
             futures[future] = folder
 
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(subfolders), desc="Processing"):
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(subfolders_info), desc="Processing"):
             pass
 
-    print(f"\n✨ 处理完成。结果保存在: {args.output_folder}")
+    # [MODIFIED] 保存 dataset 结果
+    import json
+    from datetime import datetime
+    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
+    if dataset_results:
+        with open(args.dataset_json, 'w', encoding='utf-8') as f:
+            json.dump(dataset_results, f, indent=2, ensure_ascii=False)
+
+    print(f"\n--- Processing Finished ---")
+    print(f"Total time: {time.time() - start_time:.2f}s")
+    print(f"Dataset saved to: {args.dataset_json}")
 
 if __name__ == "__main__":
     main()

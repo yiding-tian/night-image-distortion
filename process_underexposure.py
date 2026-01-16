@@ -5,6 +5,7 @@ import time
 import concurrent.futures
 import argparse
 import threading
+import json
 import random
 import albumentations as A  # 用于添加真实的 ISO 噪点
 from tqdm import tqdm
@@ -18,10 +19,6 @@ SLIGHT_FACTOR = 0.5
 SEVERE_FACTOR = 1.5
 
 # 基准参数 (Medium)
-# 1. brightness_factor: 亮度保留比例 (0.5 表示亮度减半)
-#    - 调高这个值 (如 0.6-0.8) 会让画面更亮
-#    - 调低这个值 (如 0.3-0.5) 会让画面更暗
-# 2. noise_params: 噪点相关设置 (保留原设)
 MEDIUM_PARAMS = {
     "brightness_factor": (0.4, 0.7),      # 核心修改：保留 40% 到 70% 的亮度 (中等欠曝)
     "noise_probability": (0.3, 0.6),      # 30%-60% 概率出现噪点
@@ -103,7 +100,6 @@ def apply_moderate_underexposure(img, brightness_factor, noise_prob, iso_color, 
     img_processed = img.copy()
 
     # --- Step 1: 概率性注入 ISO 噪点 ---
-    # 这会给暗部增加颗粒感，增加真实度
     if np.random.rand() < noise_prob:
         try:
             rgb_image = cv2.cvtColor(img_processed, cv2.COLOR_BGR2RGB)
@@ -119,11 +115,9 @@ def apply_moderate_underexposure(img, brightness_factor, noise_prob, iso_color, 
             pass
 
     # --- Step 2: 线性降低亮度 (Linear Dimming) ---
-    # 使用浮点数运算，避免精度丢失
     img_float = img_processed.astype(np.float32) / 255.0
     
-    # 直接乘以系数 (例如 * 0.6)
-    # 这样暗部变暗，亮部也变暗，整体直方图左移，不会丢失对比度细节
+    # 直接乘以系数
     darkened_img = img_float * brightness_factor
     
     # 截断并转回 uint8
@@ -163,9 +157,8 @@ def process_single_folder(folder_path, output_folder, level_name, params, datase
         header_h = int(h * 0.12)
         header = np.full((header_h, w * 2, 3), 255, dtype=np.uint8)
         
-        # 显示保留的亮度百分比
         info_text = f"UNDEREXPOSED ({int(b_factor*100)}% Brightness)"
-        if n_prob > np.random.rand(): # 只是为了显示，不代表实际逻辑
+        if n_prob > np.random.rand(): 
             info_text += " + NOISE"
 
         cv2.putText(header, "ORIGINAL", (int(w * 0.3), int(header_h * 0.7)), font, font_scale, (0, 0, 0), 2)
@@ -176,7 +169,7 @@ def process_single_folder(folder_path, output_folder, level_name, params, datase
     # 保存
     cv2.imwrite(output_path, final_image)
 
-    # [MODIFIED] 生成符合 CoT 逻辑的对话内容
+    # 生成符合 CoT 逻辑的对话内容
     scene_desc = get_clean_desc(visual_analysis)
     instruction_text = random.choice(QUESTION_TEMPLATES)
     
@@ -222,7 +215,7 @@ def main():
     parser.add_argument('--num_threads', type=int, default=4)
     parser.add_argument('--max_images', type=int, default=None)
     parser.add_argument('--cmp', action='store_true', help='开启对比图模式')
-    
+
     args = parser.parse_args()
 
     if not os.path.exists(args.base_folder):
@@ -264,21 +257,17 @@ def main():
             params = UNDEREXPOSURE_LEVELS[current_level]
             
             level_out_dir = os.path.join(args.output_folder, current_level)
-            
+
             future = executor.submit(process_single_folder, folder, level_out_dir, current_level, params, dataset_results, dataset_lock, visual_analysis, args.cmp)
             futures[future] = folder
 
         for _ in tqdm(concurrent.futures.as_completed(futures), total=len(subfolders_info), desc="Processing"):
             pass
 
-    # [MODIFIED] 保存 dataset 结果
-    import json
-    from datetime import datetime
-    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
     if dataset_results:
         with open(args.dataset_json, 'w', encoding='utf-8') as f:
             json.dump(dataset_results, f, indent=2, ensure_ascii=False)
-
+        
     print(f"\n--- Processing Finished ---")
     print(f"Total time: {time.time() - start_time:.2f}s")
     print(f"Dataset saved to: {args.dataset_json}")

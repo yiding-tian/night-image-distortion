@@ -7,6 +7,7 @@ import random
 import math
 import json
 import glob
+import re
 
 import cv2
 import numpy as np
@@ -19,78 +20,182 @@ from tqdm import tqdm
 # ========================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ========================================================
-# Parameters Configuration
-# ========================================================
-MEDIUM_MAX_RADIUS = 40
-SLIGHT_FACTOR = 0.5
-SEVERE_FACTOR = 2.0
-
-def get_max_radius(base_radius, factor):
-    return max(3, int(base_radius * factor))
-
-FOCUS_LEVELS = {
-    "slight": get_max_radius(MEDIUM_MAX_RADIUS, SLIGHT_FACTOR),
-    "medium": MEDIUM_MAX_RADIUS,
-    "severe": get_max_radius(MEDIUM_MAX_RADIUS, SEVERE_FACTOR)
+# ==============================================================================
+#  1. 通用失真配置 (Universal Distortion Config)
+# ==============================================================================
+DISTORTION_CONFIG = {
+    "name": "focus blur",
+    "scope_type": "Local", 
+    
+    # [基础QA] 用于描述严重程度的短语
+    "severity_desc": {
+        "medium": "with edge softening and loss of fine textures",
+        "severe": "with complete loss of structural information and shape definition"
+    },
+    
+    # [基础QA] 用于描述位置的模板
+    "location_desc": {
+        "Global": "It is a global distortion affecting the entire image frame uniformly.",
+        "Local": "It is localized, specifically affecting the {target}."
+    }
 }
 
 # ========================================================
-# System Prompt & SFT Templates (CoT Technical Version)
+# Parameters
 # ========================================================
-SYSTEM_PROMPT_TEXT = (
-    "You are a professional AI visual expert. Provide a structured Chain-of-Thought (CoT) diagnosis for nighttime images. "
-    "Your analysis must follow this exact sequence: \n"
-    "1. Scene Description: Describe the objects and environment.\n"
-    "2. Quality Issue Detection: Determine if a distortion exists.\n"
-    "3. Distribution Scope: Classify as Global or Local.\n"
-    "4. Distortion Specifics: Identify the type and the specific affected target.\n"
-    "5. Severity Level: Assess the intensity of the degradation."
+MEDIUM_PARAMS = {
+    "max_radius": (32, 38)
+}
+
+SLIGHT_FACTOR = 0.5
+SEVERE_FACTOR = 2.3
+
+# ========================================================
+# System Prompts
+# ========================================================
+SYSTEM_PROMPT_COT = (
+    "You are a professional AI visual expert. Provide a comprehensive technical diagnosis. "
+    "Regardless of how the user asks, your response must strictly follow this structure:\n"
+    "1. Image Content: Briefly describe the scene.\n"
+    "2. Distortion Issue & Severity: Identify the distortion and assess its intensity.\n"
+    "3. Distribution Scope: Determine if it is global or local."
 )
 
-QUESTION_TEMPLATES = [
-    "Analyze this nighttime image using a step-by-step technical diagnosis. First, describe the scene contents. Then, detect any image quality issues, determine their scope (Global/Local), specify the distortion type and affected target, and finally assess the severity.",
-    "Please perform a Chain-of-Thought assessment of this photo. 1. What are the main objects? 2. Is there a technical defect? 3. Is the defect global or local? 4. What is the specific distortion and where is it located? 5. What is the severity level?",
-    "Examine the image quality. Start by describing the scene, then provide a structured report covering: Issue Detection, Spatial Scope, Type & Target identification, and Severity Level.",
-    "Conduct a technical analysis: Scene Description -> Issue Detection -> Distribution Scope -> Distortion & Target Specifics -> Severity Level. Ensure each step is addressed in order.",
-    "As a visual expert, identify the elements in this scene and diagnose its quality. Is there a problem? Is it Global or Local? Name the specific distortion/target and evaluate the severity level."
-]
+SYSTEM_PROMPT_BASIC = "You are a professional AI visual expert. Answer questions about image quality accurately and concisely."
 
+# ========================================================
+# Helpers
+# ========================================================
 def get_clean_desc(visual_analysis):
+    """
+    清理 visual_analysis，移除所有与 defect/quality 相关的后缀片段
+    """
     import re
+    
+    # 移除 "Defect" 之后的所有内容
     match = re.search(r'(?i)Defect', visual_analysis)
     if match:
-        return visual_analysis[:match.start()].strip().rstrip('.,; ')
-    return visual_analysis.strip()
-
-# CoT 结构化回答模板
-ANSWER_TEMPLATE = (
-    "Technical Analysis (CoT):\n"
-    "1. Scene Description: {scene_desc}.\n"
-    "2. Quality Issue Detection: Yes, a technical degradation is identified.\n"
-    "3. Distribution Scope: {scope}.\n"
-    "4. Distortion Specifics: The {type} is specifically localized at the {target}.\n"
-    "5. Severity Level: {level}."
-)
+        visual_analysis = visual_analysis[:match.start()]
+    
+    # 移除常见的质量评估短尾巴
+    patterns_to_remove = [
+        r'\s*No\s+(severe|major|significant|obvious)[\w\s]*[\.。]?\s*$',
+        r'\s*Quality\s+is\s+[\w\s]*[\.。]?\s*$',
+        r'\s*Overall[\w\s]*[\.。]?\s*$',
+        r'\s*The\s+image\s+is[\w\s]*[\.。]?\s*$',
+    ]
+    
+    for pattern in patterns_to_remove:
+        visual_analysis = re.sub(pattern, '', visual_analysis, flags=re.IGNORECASE)
+    
+    return visual_analysis.strip().rstrip('.,;: ')
 
 # ========================================================
-# Visualization Helper: Small Dot Focus Indicator
+# Logic: 文本生成器
+# ========================================================
+def generate_universal_qa(level, distortion_conf, target_object="N/A"):
+    d_name = distortion_conf["name"]
+    d_desc = distortion_conf["severity_desc"][level]
+    scope = distortion_conf["scope_type"]
+    
+    # --- Q1: Type ---
+    q_type_opts = [
+        "Identify the specific **distortion** present in this image.",
+        "What type of **distortion** can be observed in this photograph?",
+        "Name the primary **distortion** affecting this shot."
+    ]
+    q1 = random.choice(q_type_opts)
+    a1 = f"The image suffers from **{d_name}**."
+
+    # --- Q2: Severity ---
+    q_sev_opts = [
+        "Assess the severity level of the **distortion** in this image.",
+        "How would you rate the intensity of the **distortion** in this photo?",
+        "What is the severity of the **distortion** found here?"
+    ]
+    q2 = random.choice(q_sev_opts)
+    a2 = f"The distortion is **{level}**, {d_desc}."
+
+    # --- Q3: Location ---
+    q_loc_opts = [
+        "Determine the spatial distribution of the **distortion** within this image frame.",
+        "Is the **distortion** in this picture global or localized to a specific area?",
+        "Locate the **distortion** in this specific image."
+    ]
+    q3 = random.choice(q_loc_opts)
+    
+    if scope == "Global":
+        a3 = distortion_conf["location_desc"]["Global"]
+    else:
+        a3 = distortion_conf["location_desc"]["Local"].format(target=target_object)
+
+    return [(q1, a1), (q2, a2), (q3, a3)]
+
+def generate_narrative_cot(scene_desc, level, distortion_conf, target_object="N/A"):
+    """
+    【严谨逻辑版 CoT 生成 - 修正标号】
+    强制使用 1. 2. 3. 标号，与 System Prompt 完美对齐。
+    """
+    d_name = distortion_conf["name"]
+    scope = distortion_conf["scope_type"]
+    scene_clean = scene_desc.strip().rstrip('.')
+    
+    # ----------------------------------------------------------------------
+    # Block 1: Image Content (强制 1.)
+    # ----------------------------------------------------------------------
+    # 将首字母小写，避免 "Visual analysis shows that The..." 这种错误
+    if scene_clean and scene_clean[0].isupper():
+        scene_clean = scene_clean[0].lower() + scene_clean[1:]
+    
+    part1 = f"1. Image Content: Visual analysis shows that {scene_clean}."
+
+    # ----------------------------------------------------------------------
+    # Block 2: Distortion Issue & Severity (强制 2.)
+    # ----------------------------------------------------------------------
+    issue_templates = [
+        f"2. Distortion Issue & Severity: A technical inspection reveals **{d_name}**. The degradation is of **{level}** severity.",
+        f"2. Distortion Issue & Severity: The image suffers from **{level} {d_name}**.",
+        f"2. Distortion Issue & Severity: **{d_name}** is identified as the primary defect at **{level}** level."
+    ]
+    part2 = random.choice(issue_templates)
+
+    # ----------------------------------------------------------------------
+    # Block 3: Distribution Scope (强制 3.)
+    # ----------------------------------------------------------------------
+    if scope == "Global":
+        scope_templates = [
+            "3. Distribution Scope: This is a global artifact affecting the entire frame uniformly.",
+            "3. Distribution Scope: The distortion distributes globally across the whole image field."
+        ]
+    else: # Local
+        scope_templates = [
+            f"3. Distribution Scope: This defect is localized, specifically affecting the **{target_object}**.",
+            f"3. Distribution Scope: The distortion is not global but concentrated on the **{target_object}**."
+        ]
+    part3 = random.choice(scope_templates)
+
+    # ----------------------------------------------------------------------
+    # 组装 (用换行符 \n 连接，结构更清晰)
+    # ----------------------------------------------------------------------
+    return f"{part1}\n{part2}\n{part3}"
+
+# ========================================================
+# Visualization Helper
 # ========================================================
 def draw_red_cross(img, cx, cy, img_h, img_w):
     scale = min(img_h, img_w) / 1000.0
     radius = max(2, int(4 * scale))
-    color = (0, 0, 255) # BGR: Red
-    cv2.circle(img, (cx, cy), radius + 1, (0, 0, 0), -1) 
-    cv2.circle(img, (cx, cy), radius, color, -1)     
-    return img
+    # 避免修改原图，拷贝一份
+    vis_img = img.copy()
+    cv2.circle(vis_img, (cx, cy), radius + 1, (0, 0, 0), -1) 
+    cv2.circle(vis_img, (cx, cy), radius, (0, 0, 255), -1)     
+    return vis_img
 
 # ========================================================
 # Core Logic: Depth-Aware Defocus Blur
 # ========================================================
-
 def create_disk_kernel(radius):
-    if radius <= 0:
-        return None
+    if radius <= 0: return None
     kernel_size = int(radius * 2 + 1)
     y, x = torch.meshgrid(
         torch.linspace(-radius, radius, kernel_size),
@@ -102,42 +207,40 @@ def create_disk_kernel(radius):
     kernel = kernel / kernel.sum()
     return kernel.to(DEVICE)
 
-def apply_blur_layered(img_linear, depth_map, focal_depth, max_radius, num_layers=6):
+def apply_blur_layered(img_linear, depth_map, focal_depth, max_radius, num_layers=5):
     B, C, H, W = img_linear.shape
-    depth_diff = torch.abs(depth_map - focal_depth)
+    depth_map_smoothed = F.avg_pool2d(depth_map, kernel_size=5, stride=1, padding=2)
+    depth_diff = torch.abs(depth_map_smoothed - focal_depth)
     max_diff = torch.max(depth_diff) + 1e-6
     norm_diff = depth_diff / max_diff 
     target_radii = norm_diff * max_radius
     
-    layers = [img_linear]
     step = max_radius / (num_layers - 1)
-    radii_list = [0.0]
+    radii_list = [i * step for i in range(num_layers)]
+    output = img_linear.clone()
     
-    for i in range(1, num_layers):
-        r = i * step
-        radii_list.append(r)
-        kernel = create_disk_kernel(r)
+    for i in range(num_layers - 1):
+        r_low, r_high = radii_list[i], radii_list[i+1]
+        mask = (target_radii >= r_low) & (target_radii < r_high)
+        if not torch.any(mask): continue
+        
+        r_curr = (r_low + r_high) / 2
+        kernel = create_disk_kernel(r_curr)
         if kernel is not None:
             k_size = kernel.shape[0]
             pad = k_size // 2
             kernel_4d = kernel.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1)
             img_padded = F.pad(img_linear, (pad, pad, pad, pad), mode='reflect')
             blurred = F.conv2d(img_padded, kernel_4d, groups=3)
-            layers.append(blurred)
-        else:
-            layers.append(img_linear)
+            if blurred.shape != img_linear.shape:
+                blurred = F.interpolate(blurred, size=(H, W), mode='bilinear', align_corners=False)
             
-    output = torch.zeros_like(img_linear)
-    for i in range(num_layers - 1):
-        r_low = radii_list[i]
-        r_high = radii_list[i+1]
-        mask = (target_radii >= r_low) & (target_radii <= r_high)
-        if not torch.any(mask):
-            continue
-        weight = (target_radii - r_low) / (r_high - r_low)
-        blended = layers[i] * (1.0 - weight) + layers[i+1] * weight
-        output[mask.repeat(1, 3, 1, 1)] = blended[mask.repeat(1, 3, 1, 1)]
-        
+            mask_expanded = mask.repeat(1, 3, 1, 1)
+            output[mask_expanded] = blurred[mask_expanded]
+            del kernel, kernel_4d, img_padded, blurred
+    
+    del depth_map_smoothed, target_radii, mask
+    torch.cuda.empty_cache()
     return output
 
 def apply_depth_focus_blur_torch(image_np, depth_np, focal_point, max_radius):
@@ -146,176 +249,172 @@ def apply_depth_focus_blur_torch(image_np, depth_np, focal_point, max_radius):
     img_tensor = torch.from_numpy(img_input).float().permute(2, 0, 1).unsqueeze(0).to(DEVICE) / 255.0
     img_linear = torch.pow(img_tensor + 1e-6, 2.2)
     depth_tensor = torch.from_numpy(depth_np.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(DEVICE)
+    
     fx, fy = focal_point
-    focal_depth = depth_tensor[0, 0, fy, fx].item()
-    blurred_linear = apply_blur_layered(img_linear, depth_tensor, focal_depth, max_radius)
+    y_s, y_e = max(0, fy-2), min(img_h, fy+3)
+    x_s, x_e = max(0, fx-2), min(img_w, fx+3)
+    focal_region = depth_tensor[0, 0, y_s:y_e, x_s:x_e]
+    focal_depth = torch.median(focal_region).item()
+    
+    blurred_linear = apply_blur_layered(img_linear, depth_tensor, focal_depth, max_radius, num_layers=5)
     blurred_srgb = torch.pow(blurred_linear + 1e-6, 1/2.2)
     output_np = blurred_srgb.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
     output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
+    
+    del img_tensor, img_linear, depth_tensor, blurred_linear, blurred_srgb
+    torch.cuda.empty_cache()
     return output_np[..., ::-1]
 
 # ========================================================
-# Mask Helper (With Enhanced Tolerance)
+# Mask Helper
 # ========================================================
 
 def find_focal_point_from_mask(subdir, secondary_object):
-    """
-    寻找焦点掩码，具有高容错性。
-    """
     mask_dir = os.path.join(subdir, "mask")
-    if not os.path.exists(mask_dir):
-        return None
-    
+    if not os.path.exists(mask_dir): return None
     mask_files = [f for f in os.listdir(mask_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    if not mask_files:
-        return None
+    if not mask_files: return None
 
-    # 构造多种可能的搜索变体
     orig = secondary_object.lower()
-    variants = [
-        orig,                           # "potted plant"
-        orig.replace(" ", "_"),         # "potted_plant"
-        orig.replace(" ", ""),          # "pottedplant"
-    ]
-    
-    # 如果是多词组，添加核心词（最后一个词，如 "statue"）和首词（如 "potted"）
+    variants = [orig, orig.replace(" ", "_"), orig.replace(" ", "")]
     words = orig.split()
     if len(words) > 1:
-        variants.append(words[-1])      # 核心词：statue
-        variants.append(words[0])       # 首词：potted
+        variants.append(words[-1]) # core noun
+        variants.append(words[0])  # adjective
+        if orig.endswith('s'): variants.append(orig[:-1])
 
     best_mask_path = None
-    
-    # 按照优先级尝试匹配变体
     for variant in variants:
         for f in mask_files:
             if variant in f.lower():
                 best_mask_path = os.path.join(mask_dir, f)
                 break
-        if best_mask_path:
-            break
+        if best_mask_path: break
             
-    if best_mask_path is None:
-        return None
-        
+    if best_mask_path is None: return None
     mask_img = cv2.imread(best_mask_path, cv2.IMREAD_GRAYSCALE)
-    if mask_img is None:
-        return None
-        
+    if mask_img is None: return None
     ys, xs = np.where(mask_img > 0)
-    if len(ys) == 0:
-        return None
-        
-    # 选择掩码的几何中心点
+    if len(ys) == 0: return None
     idx = len(ys) // 2
     return (int(xs[idx]), int(ys[idx]))
 
 # ========================================================
-# Workflow Logic
+# Workflow Logic (Updated)
 # ========================================================
 
-def process_single_directory(subdir, output_folder, level_name, main_subject, secondary_object, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
-    folder_name = os.path.basename(subdir)
-    image_path = os.path.join(subdir, "raw_image.jpg")
-    depth_path = os.path.join(subdir, "raw_image_depth.png")
-    
-    if not os.path.exists(image_path) or not os.path.exists(depth_path): 
-        return
-
-    image = cv2.imread(image_path)
-    depth = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
-    if image is None or depth is None: 
-        return
-    
-    h, w = image.shape[:2]
-
+def process_single_directory(subdir, output_folder, m_radius, s_radius, main_subject, secondary_object, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
+    """
+    处理单个文件夹：强制生成 Medium 和 Severe 两个版本。
+    构建 [基础QA -> CoT] 的多轮对话数据。
+    """
     try:
-        # 焦点对准 secondary_object
+        folder_name = os.path.basename(subdir)
+        image_path = os.path.join(subdir, "raw_image.jpg")
+        depth_path = os.path.join(subdir, "raw_image_depth.png")
+        if not os.path.exists(image_path) or not os.path.exists(depth_path): return
+        image = cv2.imread(image_path)
+        depth = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+        if image is None or depth is None: return
+        h, w = image.shape[:2]
+
+        # 1. 获取 Mask 焦点
         focal_point = find_focal_point_from_mask(subdir, secondary_object)
         
-        is_random_focus = False
+        # [Strict Filtering] 如果没有 Mask，直接跳过
         if focal_point is None:
-            print(f"\n[!] 匹配失败: '{folder_name}' 找不到 '{secondary_object}' 的Mask。使用随机对焦。")
-            is_random_focus = True
-            focal_point = (random.randint(int(w*0.3), int(w*0.7)), random.randint(int(h*0.3), int(h*0.7)))
+            return
 
-        max_radius = FOCUS_LEVELS[level_name]
-        blurred_image = apply_depth_focus_blur_torch(image, depth, focal_point, max_radius)
-        final_vis_image = blurred_image.copy()
-        
-        draw_red_cross(final_vis_image, focal_point[0], focal_point[1], h, w)
+        # 2. 生成图像
+        img_m = apply_depth_focus_blur_torch(image, depth, focal_point, m_radius)
+        img_s = apply_depth_focus_blur_torch(image, depth, focal_point, s_radius)
 
+        levels_to_generate = [("medium", img_m), ("severe", img_s)]
+
+        # 3. 处理 CMP 可视化 (如果开启)
         if cmp_mode:
-            orig_vis = image.copy()
-            draw_red_cross(orig_vis, focal_point[0], focal_point[1], h, w)
-            combined = np.hstack([orig_vis, final_vis_image])
+            cmp_dir = os.path.join(output_folder, "cmp_vis")
+            os.makedirs(cmp_dir, exist_ok=True)
+            
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = h / 600.0
             thickness = max(2, int(font_scale * 3))
             header_h = int(h * 0.15)
-            header = np.full((header_h, combined.shape[1], 3), 255, dtype=np.uint8)
+            header = np.full((header_h, w * 3, 3), 255, dtype=np.uint8)
             
-            target_text = f"ORIGINAL (Focus Target: {secondary_object})"
-            if is_random_focus:
-                target_text += " [MASK NOT FOUND - RANDOM]"
+            cv2.putText(header, "ORIGINAL", (int(w * 0.35), int(header_h * 0.7)), font, font_scale, (0, 0, 0), thickness)
+            cv2.putText(header, "MEDIUM", (int(w * 1.35), int(header_h * 0.7)), font, font_scale, (255, 0, 0), thickness)
+            cv2.putText(header, "SEVERE", (int(w * 2.35), int(header_h * 0.7)), font, font_scale, (0, 0, 255), thickness)
             
-            cv2.putText(header, target_text, (int(w * 0.1), int(header_h * 0.7)), font, font_scale, (0, 0, 0), thickness)
-            cv2.putText(header, f"DEPTH DEFOCUS (Max R={max_radius})", (int(w * 1.1), int(header_h * 0.7)), font, font_scale, (0, 0, 255), thickness)
-            final_vis_image = np.vstack([header, combined])
+            orig_vis = draw_red_cross(image, focal_point[0], focal_point[1], h, w)
+            main_body = np.hstack([orig_vis, img_m, img_s])
+            cmp_img = np.vstack([header, main_body])
             
-        output_filename = f"{folder_name}.jpg"
-        os.makedirs(output_folder, exist_ok=True)
-        out_path = os.path.join(output_folder, output_filename)
-        cv2.imwrite(out_path, final_vis_image)
+            cv2.imwrite(os.path.join(cmp_dir, f"{folder_name}_cmp.jpg"), cmp_img)
 
-        # [MODIFIED] 生成符合 CoT 逻辑的对话内容 (system + user + assistant)
         scene_desc = get_clean_desc(visual_analysis)
-        instruction_text = random.choice(QUESTION_TEMPLATES)
+        new_entries = []
         
-        answer_text = ANSWER_TEMPLATE.format(
-            scene_desc=scene_desc,
-            scope="Local",
-            type="Defocus Blur",
-            target=main_subject,
-            level=level_name.capitalize()
-        )
+        # CoT 提问模板
+        cot_user_prompts = [
+            "Please perform a detailed image quality assessment for this nighttime photo.",
+            "Evaluate the visual quality of this night scene and diagnose any technical defects.",
+            "I need a professional analysis of this nighttime image's quality issues.",
+            "Assess the clarity of this night shot and explain what specific distortion is present."
+        ]
 
-        entry = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT_TEXT
-                },
-                {
-                    "role": "user",
-                    "content": f"{instruction_text}\n<image>"
-                },
-                {
-                    "role": "assistant",
-                    "content": answer_text
-                }
-            ],
-            "images": [
-                out_path 
-            ]
-        }
-
-        with dataset_lock:
-            dataset_results.append(entry)
+        # 4. 核心数据生成循环
+        for level_name, final_img in levels_to_generate:
+            
+            # 保存训练图片
+            lvl_dir = os.path.join(output_folder, level_name)
+            os.makedirs(lvl_dir, exist_ok=True)
+            out_path = os.path.join(lvl_dir, f"{folder_name}.jpg")
+            cv2.imwrite(out_path, final_img)
+            
+            # 1. 生成 3 条基础 QA
+            qa_list = generate_universal_qa(level_name, DISTORTION_CONFIG, main_subject)
+            for q, a in qa_list:
+                new_entries.append({
+                    "_meta_level": level_name,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT_BASIC},
+                        {"role": "user", "content": f"{q}\n<image>"},
+                        {"role": "assistant", "content": a}
+                    ],
+                    "images": [out_path]
+                })
+            
+            # 2. 生成 1 条 CoT
+            cot_paragraph = generate_narrative_cot(scene_desc, level_name, DISTORTION_CONFIG, main_subject)
+            selected_prompt = random.choice(cot_user_prompts)
+            
+            new_entries.append({
+                "_meta_level": level_name,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT_COT},
+                    {"role": "user", "content": f"{selected_prompt}\n<image>"},
+                    {"role": "assistant", "content": cot_paragraph}
+                ],
+                "images": [out_path]
+            })
         
+        if new_entries:
+            with dataset_lock:
+                dataset_results.extend(new_entries)
+
     except Exception as e:
-        print(f"Error processing {folder_name}: {e}")
+        print(f"[ERROR] Failed to process {folder_name}: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Depth-Aware Defocus Blur with Enhanced Mask Search.")
+    parser = argparse.ArgumentParser(description="Generate Depth-Aware Defocus Blur (Multi-turn CoT)")
     parser.add_argument("--base_folder", type=str, required=True)
     parser.add_argument("--main_json", type=str, required=True)
     parser.add_argument("--output_folder", type=str, default="depth_focus_blur_outputs")
     parser.add_argument("--num_threads", type=int, default=4)
     parser.add_argument("--max_images", type=int, default=None)
-    parser.add_argument("--dataset_json", type=str, default="focus_blur_sft.json", help="SFT 数据集 JSON 文件名")
-    parser.add_argument('--level', type=str, choices=['slight', 'medium', 'severe', 'random'], default='medium')
-    parser.add_argument('--cmp', action='store_true')
+    parser.add_argument("--dataset_json", type=str, default="focus_blur_dataset.json")
+    parser.add_argument('--cmp', action='store_true', help="Enable comparison mode (vis grid).")
 
     args = parser.parse_args()
 
@@ -325,11 +424,7 @@ def main():
 
     with open(args.main_json, 'r', encoding='utf-8') as f:
         main_data_raw = json.load(f)
-
-    if isinstance(main_data_raw, list):
-        config_data = {item['filename']: item for item in main_data_raw}
-    else:
-        config_data = main_data_raw
+    config_data = {item['filename']: item for item in main_data_raw} if isinstance(main_data_raw, list) else main_data_raw
 
     tasks = []
     for filename, info in config_data.items():
@@ -345,35 +440,52 @@ def main():
             if secondary_obj and main_subject:
                 tasks.append((subdir, main_subject, secondary_obj, visual_analysis))
 
-    if args.max_images:
-        tasks = tasks[:args.max_images]
+    if args.max_images: tasks = tasks[:args.max_images]
 
     dataset_results = []
     dataset_lock = threading.Lock()
     start_time = time.time()
-    available_levels = ['slight', 'medium', 'severe']
-
-    print(f"🚀 Started | Tasks: {len(tasks)}")
+    
+    print(f"🚀 Started | Tasks: {len(tasks)} | Mode: Multi-turn CoT | Saving Medium & Severe")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_threads) as executor:
-        futures = {executor.submit(
-            process_single_directory, s, 
-            os.path.join(args.output_folder, args.level if args.level != 'random' else random.choice(available_levels)), 
-            args.level if args.level != 'random' else random.choice(available_levels), 
-            m, o, dataset_results, dataset_lock, v, args.cmp
-        ): s for s, m, o, v in tasks}
+        futures = {}
+        for s, m, o, v in tasks:
+            m_radius = random.randint(*MEDIUM_PARAMS["max_radius"])
+            s_radius = int(m_radius * SEVERE_FACTOR)
+            if s_radius <= m_radius: s_radius = m_radius + 10
+            
+            future = executor.submit(
+                process_single_directory, s, args.output_folder, 
+                m_radius, s_radius, m, o, 
+                dataset_results, dataset_lock, v, args.cmp
+            )
+            futures[future] = s
         
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Processing"):
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing"):
             pass
 
-    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
+    # Save results - Separate into two JSONs
     if dataset_results:
-        with open(args.dataset_json, 'w', encoding='utf-8') as f:
-            json.dump(dataset_results, f, indent=2, ensure_ascii=False)
+        base_name = os.path.splitext(args.dataset_json)[0]
+        for sfx in ["_slight", "_medium", "_severe", "_random"]:
+            if base_name.endswith(sfx): base_name = base_name[:-len(sfx)]
+        
+        for lvl in ["medium", "severe"]:
+            lvl_results = []
+            for item in dataset_results:
+                if item.get("_meta_level") == lvl:
+                    clean_item = item.copy()
+                    clean_item.pop("_meta_level", None)
+                    lvl_results.append(clean_item)
+            
+            if lvl_results:
+                out_name = f"{base_name}_{lvl}.json"
+                with open(out_name, 'w', encoding='utf-8') as f:
+                    json.dump(lvl_results, f, indent=2, ensure_ascii=False)
+                print(f"Dataset saved to: {out_name} (Count: {len(lvl_results)})")
 
-    print(f"\n--- Processing Finished ---")
     print(f"Total time: {time.time() - start_time:.2f}s")
-    print(f"Dataset saved to: {args.dataset_json}")
 
 if __name__ == "__main__":
     main()

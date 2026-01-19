@@ -15,91 +15,165 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# ========================================================
-# Parameters Configuration (Motion Blur Tuning)
-# ========================================================
-# 用户可直接调整的倍率参数
-SLIGHT_FACTOR = 0.5
-SEVERE_FACTOR = 2.0
+# ==============================================================================
+#  1. 通用失真配置 (Universal Distortion Config)
+# ==============================================================================
+DISTORTION_CONFIG = {
+    "name": "motion blur",
+    "scope_type": "Local", 
+    
+    # [基础QA] 用于描述严重程度的短语
+    "severity_desc": {
+        "medium": "with noticeable trailing artifacts along the movement path",
+        "severe": "with heavy directional smearing and loss of object definition"
+    },
+    
+    # [基础QA] 用于描述位置的模板
+    "location_desc": {
+        "Global": "It is a global distortion affecting the entire image frame uniformly.",
+        "Local": "It is localized, specifically affecting the {target}."
+    }
+}
 
-# --- Device Configuration (Auto-detect GPU) ---
+# ========================================================
+# Parameters
+# ========================================================
+SLIGHT_FACTOR = 0.5
+SEVERE_FACTOR = 3.5  # [修改] 虽然这里只作参考，但在 main 逻辑中已大幅强化
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 以 Medium 为基准
 MEDIUM_PARAMS = {
-    # [优化] 增加采样步数，让模糊效果更稠密、更细腻，显著提升“糊”的质感
-    "steps": (100, 150),
-    # [优化] 降低基础系数，配合非线性计算逻辑，减小细小物体的拖影
-    "intensity": (0.15, 0.35),
-    # 垂直偏移范围锁定在极小值，保证高度一致
-    "vertical_shift_factor": (-0.015, 0.015),
-    # [优化] 大幅降低噪点强度，让模糊看起来更丝滑、更干净
-    "noise_range": (0.01, 0.03),
-    # 关闭波动逻辑
+    "steps": (30, 35),
+    "intensity": (0.1, 0.15),
+    "vertical_shift_factor": (0.008, 0.012),
+    "noise_range": (0.01, 0.015),
     "curve_freq": 0.0,
     "curve_amp": 0.0
 }
 
-def calculate_level_params(base_params, factor):
-    params = {}
-    for k, v in base_params.items():
-        if isinstance(v, tuple):
-            if k == "steps":
-                params[k] = (max(20, int(v[0] * factor)), max(20, int(v[1] * factor)))
-            elif k == "intensity":
-                params[k] = (v[0] * factor, v[1] * factor)
-            elif k == "noise_range":
-                params[k] = (v[0] * factor, v[1] * factor)
-            else:
-                params[k] = v
-        else:
-            params[k] = v * factor
-    return params
-
-MOTION_BLUR_LEVELS = {
-    "slight": calculate_level_params(MEDIUM_PARAMS, SLIGHT_FACTOR),
-    "medium": MEDIUM_PARAMS,
-    "severe": calculate_level_params(MEDIUM_PARAMS, SEVERE_FACTOR)
-}
-
 # ========================================================
-# System Prompt & SFT Templates (CoT Technical Version)
+# System Prompts
 # ========================================================
-SYSTEM_PROMPT_TEXT = (
-    "You are a professional AI visual expert. Provide a structured Chain-of-Thought (CoT) diagnosis for nighttime images. "
-    "Your analysis must follow this exact sequence: \n"
-    "1. Scene Description: Describe the objects and environment.\n"
-    "2. Quality Issue Detection: Determine if a distortion exists.\n"
-    "3. Distribution Scope: Classify as Global or Local.\n"
-    "4. Distortion Specifics: Identify the type and the specific affected target.\n"
-    "5. Severity Level: Assess the intensity of the degradation."
+SYSTEM_PROMPT_COT = (
+    "You are a professional AI visual expert. Provide a comprehensive technical diagnosis. "
+    "Regardless of how the user asks, your response must strictly follow this structure:\n"
+    "1. Image Content: Briefly describe the scene.\n"
+    "2. Distortion Issue & Severity: Identify the distortion and assess its intensity.\n"
+    "3. Distribution Scope: Determine if it is global or local."
 )
 
-QUESTION_TEMPLATES = [
-    "Analyze this nighttime image using a step-by-step technical diagnosis. First, describe the scene contents. Then, detect any image quality issues, determine their scope (Global/Local), specify the distortion type and affected target, and finally assess the severity.",
-    "Please perform a Chain-of-Thought assessment of this photo. 1. What are the main objects? 2. Is there a technical defect? 3. Is the defect global or local? 4. What is the specific distortion and where is it located? 5. What is the severity level?",
-    "Examine the image quality. Start by describing the scene, then provide a structured report covering: Issue Detection, Spatial Scope, Type & Target identification, and Severity Level.",
-    "Conduct a technical analysis: Scene Description -> Issue Detection -> Distribution Scope -> Distortion & Target Specifics -> Severity Level. Ensure each step is addressed in order.",
-    "As a visual expert, identify the elements in this scene and diagnose its quality. Is there a problem? Is it Global or Local? Name the specific distortion/target and evaluate the severity level."
-]
+SYSTEM_PROMPT_BASIC = "You are a professional AI visual expert. Answer questions about image quality accurately and concisely."
 
+# ========================================================
+# Helpers
+# ========================================================
 def get_clean_desc(visual_analysis):
+    """
+    清理 visual_analysis，移除所有与 defect/quality 相关的后缀片段
+    """
     import re
-    # 查找 Defect, Defects, Defect Scan (不区分大小写)
+    
+    # 移除 "Defect" 之后的所有内容
     match = re.search(r'(?i)Defect', visual_analysis)
     if match:
-        return visual_analysis[:match.start()].strip().rstrip('.,; ')
-    return visual_analysis.strip()
+        visual_analysis = visual_analysis[:match.start()]
+    
+    # 移除常见的质量评估短尾巴
+    patterns_to_remove = [
+        r'\s*No\s+(severe|major|significant|obvious)[\w\s]*[\.。]?\s*$',
+        r'\s*Quality\s+is\s+[\w\s]*[\.。]?\s*$',
+        r'\s*Overall[\w\s]*[\.。]?\s*$',
+        r'\s*The\s+image\s+is[\w\s]*[\.。]?\s*$',
+    ]
+    
+    for pattern in patterns_to_remove:
+        visual_analysis = re.sub(pattern, '', visual_analysis, flags=re.IGNORECASE)
+    
+    return visual_analysis.strip().rstrip('.,;: ')
 
-# CoT 结构化回答模板
-ANSWER_TEMPLATE = (
-    "Technical Analysis (CoT):\n"
-    "1. Scene Description: {scene_desc}.\n"
-    "2. Quality Issue Detection: Yes, a technical degradation is identified.\n"
-    "3. Distribution Scope: {scope}.\n"
-    "4. Distortion Specifics: The {type} is specifically localized at the {target}.\n"
-    "5. Severity Level: {level}."
-)
+# ========================================================
+# Logic: 文本生成器
+# ========================================================
+def generate_universal_qa(level, distortion_conf, target_object="N/A"):
+    d_name = distortion_conf["name"]
+    d_desc = distortion_conf["severity_desc"][level]
+    scope = distortion_conf["scope_type"]
+    
+    # --- Q1: Type ---
+    q_type_opts = [
+        "Identify the specific **distortion** present in this image.",
+        "What type of **distortion** can be observed in this photograph?",
+        "Name the primary **distortion** affecting this shot."
+    ]
+    q1 = random.choice(q_type_opts)
+    a1 = f"The image suffers from **{d_name}**."
+
+    # --- Q2: Severity ---
+    q_sev_opts = [
+        "Assess the severity level of the **distortion** in this image.",
+        "How would you rate the intensity of the **distortion** in this photo?",
+        "What is the severity of the **distortion** found here?"
+    ]
+    q2 = random.choice(q_sev_opts)
+    a2 = f"The distortion is **{level}**, {d_desc}."
+
+    # --- Q3: Location ---
+    q_loc_opts = [
+        "Determine the spatial distribution of the **distortion** within this image frame.",
+        "Is the **distortion** in this picture global or localized to a specific area?",
+        "Locate the **distortion** in this specific image."
+    ]
+    q3 = random.choice(q_loc_opts)
+    
+    if scope == "Global":
+        a3 = distortion_conf["location_desc"]["Global"]
+    else:
+        a3 = distortion_conf["location_desc"]["Local"].format(target=target_object)
+
+    return [(q1, a1), (q2, a2), (q3, a3)]
+
+def generate_narrative_cot(scene_desc, level, distortion_conf, target_object="N/A"):
+    """
+    【严谨逻辑版 CoT 生成 - 修正标号】
+    """
+    d_name = distortion_conf["name"]
+    scope = distortion_conf["scope_type"]
+    scene_clean = scene_desc.strip().rstrip('.')
+    
+    # ----------------------------------------------------------------------
+    # Block 1: Image Content
+    # ----------------------------------------------------------------------
+    if scene_clean and scene_clean[0].isupper():
+        scene_clean = scene_clean[0].lower() + scene_clean[1:]
+    
+    part1 = f"1. Image Content: Visual analysis shows that {scene_clean}."
+
+    # ----------------------------------------------------------------------
+    # Block 2: Distortion Issue & Severity
+    # ----------------------------------------------------------------------
+    issue_templates = [
+        f"2. Distortion Issue & Severity: A technical inspection reveals **{d_name}**. The degradation is of **{level}** severity.",
+        f"2. Distortion Issue & Severity: The image suffers from **{level} {d_name}**.",
+        f"2. Distortion Issue & Severity: **{d_name}** is identified as the primary defect at **{level}** level."
+    ]
+    part2 = random.choice(issue_templates)
+
+    # ----------------------------------------------------------------------
+    # Block 3: Distribution Scope
+    # ----------------------------------------------------------------------
+    if scope == "Global":
+        scope_templates = [
+            "3. Distribution Scope: This is a global artifact affecting the entire frame uniformly.",
+            "3. Distribution Scope: The distortion distributes globally across the whole image field."
+        ]
+    else: # Local
+        scope_templates = [
+            f"3. Distribution Scope: This defect is localized, specifically affecting the **{target_object}**.",
+            f"3. Distribution Scope: The distortion is not global but concentrated on the **{target_object}**."
+        ]
+    part3 = random.choice(scope_templates)
+
+    return f"{part1}\n{part2}\n{part3}"
 
 # ========================================================
 # Core Logic
@@ -127,8 +201,7 @@ def find_motion_masks(mask_dir, target_label):
 def calculate_adaptive_magnitude(w, h, intensity, level_name):
     """
     [核心修改] 自适应物体大小计算移动距离：
-    1. 使用非线性缩放：细小物体的位移进一步压低。
-    2. 针对大物体：稍微放宽上限，使其拖影可见但不过长。
+    大幅提高了 Severe 级别的上限，允许产生更长的拖影。
     """
     diagonal = np.sqrt(w**2 + h**2)
     
@@ -139,28 +212,33 @@ def calculate_adaptive_magnitude(w, h, intensity, level_name):
     if level_name == "slight":
         max_limit = 25.0
     elif level_name == "medium":
-        max_limit = 55.0  # 稍微从 45 调高到 55
+        max_limit = 55.0  
     else:
-        max_limit = 95.0  # 稍微从 80 调高到 95
+        # [修改] 从 95.0 大幅提升至 200.0，允许非常夸张的拖影
+        max_limit = 200.0  
         
     MIN_SHIFT_PX = 1.5
 
     # 逻辑：对于小物体，应用一个衰减系数
     if diagonal < 200:
-        # 物体越小，衰减越厉害
         damp = max(0.4, diagonal / 200.0)
         base_magnitude *= damp
 
     # 逻辑：对于大物体，使用软上限
     if base_magnitude > max_limit:
-        final_magnitude = max_limit + (base_magnitude - max_limit) * 0.12
+        # [修改] 增加软上限的斜率 (0.12 -> 0.25)，让超出 limit 的部分保留更多
+        final_magnitude = max_limit + (base_magnitude - max_limit) * 0.25
     else:
         final_magnitude = base_magnitude
 
     final_magnitude = max(MIN_SHIFT_PX, final_magnitude)
     
-    # 限制最大不超过物体自身最小尺寸的 50%
-    limit_ratio = 0.5
+    # 限制最大不超过物体自身最小尺寸的比例
+    if level_name == "severe":
+        limit_ratio = 0.75 # [修改] 严重模式下，允许拖影长度达到物体尺寸的 75%
+    else:
+        limit_ratio = 0.5
+
     final_magnitude = min(final_magnitude, min(w, h) * limit_ratio)
 
     return final_magnitude
@@ -218,7 +296,7 @@ def apply_physical_motion_blur_torch(image_np, mask_np, steps, trans_x, trans_y,
         warped_img = F.grid_sample(img_tensor, grid_t, align_corners=True, padding_mode="border")
         warped_mask = F.grid_sample(mask_tensor, grid_t, align_corners=True, mode="bilinear", padding_mode="zeros")
 
-        # 模拟快门均匀开启过程，权重设为 1.0
+        # 模拟快门均匀开启过程
         weight = 1.0 
 
         accumulated_img += warped_img * warped_mask * weight
@@ -232,7 +310,7 @@ def apply_physical_motion_blur_torch(image_np, mask_np, steps, trans_x, trans_y,
     blurred_object = torch.pow(blurred_object + 1e-6, 1/2.2)
     img_orig_gamma = torch.pow(img_tensor + 1e-6, 1/2.2)
     
-    # 注入微量噪点（已调低）
+    # 注入微量噪点
     blurred_object = add_matched_noise(blurred_object, intensity=noise_level)
 
     # 混合原图与模糊层
@@ -243,121 +321,112 @@ def apply_physical_motion_blur_torch(image_np, mask_np, steps, trans_x, trans_y,
     output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
     return output_np[..., ::-1]
 
-def process_single_directory(subdir, target_label, output_folder, level_name, current_level_params, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
-    folder_name = os.path.basename(subdir)
-    image_path = os.path.join(subdir, "raw_image.jpg")
-    mask_dir = os.path.join(subdir, "mask")
-    
-    if not os.path.exists(image_path): return
-
-    matched_paths = find_motion_masks(mask_dir, target_label)
-    if not matched_paths: return
-
-    image = cv2.imread(image_path)
-    if image is None: return
-    h_img, w_img = image.shape[:2]
-    
-    mask_info = []
-    for m_path in matched_paths:
-        m = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
-        if m is not None:
-            if m.shape != (h_img, w_img):
-                 m = cv2.resize(m, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
-            area = np.sum(m > 0)
-            if area > 0:
-                mask_info.append({"mask": m, "area": area, "path": m_path})
-    
-    if not mask_info: return
-    mask_info.sort(key=lambda x: x["area"], reverse=True)
-    selected_masks = mask_info[:2]
-    
-    combined_mask = np.zeros((h_img, w_img), dtype=np.uint8)
-    for info in selected_masks:
-        combined_mask = cv2.bitwise_or(combined_mask, info["mask"])
-
-    tqdm.write(f"[INFO] Processing '{folder_name}' | Target: {target_label} | Selected: {len(selected_masks)}")
-
-    coords = cv2.findNonZero(combined_mask)
-    if coords is None: return
-    x, y, w, h = cv2.boundingRect(coords)
-    
-    # 1. 计算自适应位移距离 (应用新逻辑)
-    magnitude = calculate_adaptive_magnitude(w, h, current_level_params["intensity"], level_name)
-
-    # 2. 随机化运动参数
-    noise_val = random.uniform(*current_level_params["noise_range"])
-    direction_x = random.choice([-1, 1])
-    direction_y = random.choice([-1, 1])
-    
-    trans_x = magnitude * direction_x
-    trans_y = magnitude * current_level_params["vertical_shift_factor"][1] * direction_y
-
+def process_single_directory(subdir, target_label, output_folder, m_int, m_steps, m_v_shift, m_noise, s_int, s_steps, s_v_shift, s_noise, dataset_results, dataset_lock, visual_analysis, cmp_mode=False):
     try:
-        # 3. 增强掩码边缘
+        folder_name = os.path.basename(subdir)
+        image_path = os.path.join(subdir, "raw_image.jpg")
+        mask_dir = os.path.join(subdir, "mask")
+        if not os.path.exists(image_path): return
+        matched_paths = find_motion_masks(mask_dir, target_label)
+        if not matched_paths:
+            print(f"[SKIP] {folder_name}: Target object '{target_label}' mask not found.")
+            return
+        image = cv2.imread(image_path)
+        if image is None: return
+        h_img, w_img = image.shape[:2]
+        
+        # 合并 Mask
+        mask_info = []
+        for m_path in matched_paths:
+            m = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
+            if m is not None:
+                if m.shape != (h_img, w_img):
+                    m = cv2.resize(m, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+                area = np.sum(m > 0)
+                if area > 0: mask_info.append({"mask": m, "area": area})
+        if not mask_info:
+            print(f"[SKIP] {folder_name}: No valid mask found for '{target_label}'.")
+            return
+        mask_info.sort(key=lambda x: x["area"], reverse=True)
+        selected_masks = mask_info[:2]
+        combined_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        for info in selected_masks: combined_mask = cv2.bitwise_or(combined_mask, info["mask"])
+        coords = cv2.findNonZero(combined_mask)
+        if coords is None: 
+            print(f"[SKIP] {folder_name}: Combined mask is empty for '{target_label}'.")
+            return
+        x, y, bw, bh = cv2.boundingRect(coords)
         soft_mask = refine_mask_edges(combined_mask)
-        
-        # 4. 执行高步数物理模糊
-        final_img = apply_physical_motion_blur_torch(
-            image, 
-            soft_mask, 
-            steps=current_level_params["steps"], 
-            trans_x=trans_x,
-            trans_y=trans_y, 
-            noise_level=noise_val
-        )
-        
+
+        def process_core(intensity, steps, v_shift, noise_val, level_name):
+            magnitude = calculate_adaptive_magnitude(bw, bh, intensity, level_name)
+            return apply_physical_motion_blur_torch(image, soft_mask, steps=steps, trans_x=magnitude, trans_y=magnitude*v_shift, noise_level=noise_val)
+
+        img_m = process_core(m_int, m_steps, m_v_shift, m_noise, "medium")
+        img_s = process_core(s_int, s_steps, s_v_shift, s_noise, "severe")
+
+        final_m, final_s = img_m, img_s
         if cmp_mode:
-            h_v, w_v, c_v = image.shape
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = h_v / 600.0
+            font_scale = h_img / 600.0
             thickness = max(2, int(font_scale * 3))
-            header_h = int(h_v * 0.15)
-            header = np.full((header_h, w_v * 2, c_v), 255, dtype=np.uint8)
-            cv2.putText(header, f"ORIGINAL ({target_label})", (int(w_v * 0.35), int(header_h * 0.7)), font, font_scale, (0, 0, 0), thickness)
-            cv2.putText(header, "MOTION BLUR", (int(w_v * 1.35), int(header_h * 0.7)), font, font_scale, (0, 0, 255), thickness)
-            main_body = np.hstack([image, final_img])
-            final_img = np.vstack([header, main_body])
+            header_h = int(h_img * 0.15)
+            header = np.full((header_h, w_img * 3, 3), 255, dtype=np.uint8)
+            cv2.putText(header, "ORIGINAL", (int(w_img * 0.35), int(header_h * 0.7)), font, font_scale, (0, 0, 0), thickness)
+            cv2.putText(header, "MEDIUM", (int(w_img * 1.35), int(header_h * 0.7)), font, font_scale, (255, 0, 0), thickness)
+            cv2.putText(header, "SEVERE", (int(w_img * 2.35), int(header_h * 0.7)), font, font_scale, (0, 0, 255), thickness)
+            main_body = np.hstack([image, img_m, img_s])
+            cmp_img = np.vstack([header, main_body])
+            final_m, final_s = cmp_img, cmp_img
 
-        output_filename = f"{folder_name}.jpg"
-        os.makedirs(output_folder, exist_ok=True)
-        out_path = os.path.join(output_folder, output_filename)
-        cv2.imwrite(out_path, final_img)
-
-        # [MODIFIED] 生成符合 CoT 逻辑的对话内容 (system + user + assistant)
         scene_desc = get_clean_desc(visual_analysis)
-        instruction_text = random.choice(QUESTION_TEMPLATES)
+        new_entries = []
         
-        answer_text = ANSWER_TEMPLATE.format(
-            scene_desc=scene_desc,
-            scope="Local",
-            type="Motion Blur",
-            target=target_label,
-            level=level_name.capitalize()
-        )
-
-        entry = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT_TEXT
-                },
-                {
-                    "role": "user",
-                    "content": f"{instruction_text}\n<image>"
-                },
-                {
-                    "role": "assistant",
-                    "content": answer_text
-                }
-            ],
-            "images": [
-                out_path 
-            ]
-        }
-
-        with dataset_lock:
-            dataset_results.append(entry)
+        # CoT 提问模板
+        cot_user_prompts = [
+            "Please perform a detailed image quality assessment for this nighttime photo.",
+            "Evaluate the visual quality of this night scene and diagnose any technical defects.",
+            "I need a professional analysis of this nighttime image's quality issues.",
+            "Assess the clarity of this night shot and explain what specific distortion is present."
+        ]
         
+        for level_name, final_img in [("medium", final_m), ("severe", final_s)]:
+            lvl_dir = os.path.join(output_folder, level_name)
+            os.makedirs(lvl_dir, exist_ok=True)
+            out_path = os.path.join(lvl_dir, f"{folder_name}.jpg")
+            cv2.imwrite(out_path, final_img)
+            
+            # 1. 生成 3 条基础 QA
+            qa_list = generate_universal_qa(level_name, DISTORTION_CONFIG, target_label)
+            for q, a in qa_list:
+                new_entries.append({
+                    "_meta_level": level_name,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT_BASIC},
+                        {"role": "user", "content": f"{q}\n<image>"},
+                        {"role": "assistant", "content": a}
+                    ],
+                    "images": [out_path]
+                })
+            
+            # 2. 生成 1 条 CoT
+            cot_paragraph = generate_narrative_cot(scene_desc, level_name, DISTORTION_CONFIG, target_label)
+            selected_prompt = random.choice(cot_user_prompts)
+            
+            new_entries.append({
+                "_meta_level": level_name,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT_COT},
+                    {"role": "user", "content": f"{selected_prompt}\n<image>"},
+                    {"role": "assistant", "content": cot_paragraph}
+                ],
+                "images": [out_path]
+            })
+        
+        if new_entries:
+            with dataset_lock:
+                dataset_results.extend(new_entries)
+
     except Exception as e:
         tqdm.write(f"[ERROR] {folder_name}: {e}")
 
@@ -368,11 +437,11 @@ def main():
     parser.add_argument("--max_images", type=int, default=None)
     parser.add_argument("--output_folder", type=str, default="motion_blur_outputs")
     parser.add_argument("--num_threads", type=int, default=4)
-    parser.add_argument('--level', type=str, choices=['slight', 'medium', 'severe', 'random'], default='medium')
-    parser.add_argument("--dataset_json", type=str, default="motion_blur_sft.json", help="SFT 数据集 JSON 文件名")
+    parser.add_argument("--dataset_json", type=str, default="motion_blur_dataset.json", help="SFT 数据集 JSON 文件名")
     parser.add_argument('--cmp', action='store_true')
 
     args = parser.parse_args()
+    
     if not os.path.exists(args.main_json):
         print(f"Error: JSON file '{args.main_json}' not found.")
         return
@@ -400,36 +469,63 @@ def main():
     if args.max_images: tasks = tasks[:args.max_images]
     dataset_results, dataset_lock = [], threading.Lock()
     start_time = time.time()
-    print(f"Task Started | Level Mode: {args.level.upper()} | Target Images: {len(tasks)}")
-    available_levels = ['slight', 'medium', 'severe']
+    
+    print(f"🚀 Started | Generating BOTH Medium & Severe | Tasks: {len(tasks)}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_threads) as executor:
         futures = {}
         for p, t, v in tasks:
-            current_level_name = args.level if args.level != 'random' else random.choice(available_levels)
-            level_params = MOTION_BLUR_LEVELS[current_level_name]
-            steps_val = random.randint(*level_params["steps"])
-            intensity_val = random.uniform(*level_params["intensity"])
-            current_params = {
-                'steps': steps_val, 
-                'intensity': intensity_val, 
-                'vertical_shift_factor': level_params["vertical_shift_factor"],
-                'noise_range': level_params['noise_range']
-            }
-            level_output_folder = f"{args.output_folder}/{current_level_name}"
-            future = executor.submit(process_single_directory, p, t, level_output_folder, current_level_name, current_params, dataset_results, dataset_lock, v, args.cmp)
+            # 1. 采样一次 Medium 基准参数
+            m_steps = random.randint(*MEDIUM_PARAMS["steps"])
+            m_intensity = random.uniform(*MEDIUM_PARAMS["intensity"])
+            m_v_shift = random.uniform(*MEDIUM_PARAMS["vertical_shift_factor"])
+            m_noise = random.uniform(*MEDIUM_PARAMS["noise_range"])
+
+            # 2. 计算 Severe 参数（大幅提高倍率）
+            # [修改] 强度倍率从 4.2 提升至 6.0，让拖影更长
+            s_intensity = m_intensity * 6.0 
+            
+            # [修改] 步数必须跟随变大，防止出现断裂，倍率从 2.5 提升至 5.0
+            s_steps = int(m_steps * 5.0) 
+            
+            # [修改] 垂直偏移倍率提升，增加混乱感
+            s_v_shift = m_v_shift * 3.0 
+            
+            s_noise = m_noise * 2.0 
+            
+            # 3. 提交统一任务
+            future = executor.submit(
+                process_single_directory, p, t, args.output_folder, 
+                m_intensity, m_steps, m_v_shift, m_noise,
+                s_intensity, s_steps, s_v_shift, s_noise,
+                dataset_results, dataset_lock, v, args.cmp
+            )
             futures[future] = (p, t)
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Processing images"):
+
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing Levels"):
             pass
 
-    # [MODIFIED] Save dataset to JSON file (符合用户样例：扁平列表格式)
+    # 4. 自动分发保存数据集
     if dataset_results:
-        with open(args.dataset_json, 'w', encoding='utf-8') as f:
-            json.dump(dataset_results, f, indent=2, ensure_ascii=False)
+        base_name = os.path.splitext(args.dataset_json)[0]
+        for sfx in ["_slight", "_medium", "_severe", "_random"]:
+            if base_name.endswith(sfx): base_name = base_name[:-len(sfx)]
 
-    print(f"\n--- Processing Finished ---")
+        for lvl in ["medium", "severe"]:
+            lvl_results = []
+            for item in dataset_results:
+                if item.get("_meta_level") == lvl:
+                    clean_item = item.copy()
+                    clean_item.pop("_meta_level", None)
+                    lvl_results.append(clean_item)
+            
+            if lvl_results:
+                out_name = f"{base_name}_{lvl}.json"
+                with open(out_name, 'w', encoding='utf-8') as f:
+                    json.dump(lvl_results, f, indent=2, ensure_ascii=False)
+                print(f"Dataset saved to: {out_name} (Count: {len(lvl_results)})")
+
     print(f"Total time: {time.time() - start_time:.2f}s")
-    print(f"Dataset saved to: {args.dataset_json}")
 
 if __name__ == "__main__":
     main()
